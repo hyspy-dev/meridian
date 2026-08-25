@@ -1,0 +1,74 @@
+# Rebuilds the launcher's catalog.json and deploys it to GitHub Pages.
+#
+# Zero git commits: `actions/deploy-pages` publishes an artifact (Pages must be set to the
+# "GitHub Actions" source in this repo's settings). The launcher fetches the resulting
+#   https://hyspy-dev.github.io/meridian/catalog.json
+# from the CDN — no GitHub API, no rate limit.
+#
+# Triggers:
+#   • repository_dispatch (catalog-update) — fired by release-component.yml seconds after any
+#     component release; the normal path.
+#   • workflow_dispatch — manual rebuild (e.g. after deleting/yanking a release).
+#   • schedule (daily) — safety net for a missed dispatch; deploy-only, still commit-free.
+#   • push to the builder/workflow — logic changes take effect immediately.
+name: Catalog
+
+on:
+  repository_dispatch:
+    types: [catalog-update]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/build-catalog.py'
+      - '.github/workflows/catalog.yml'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: catalog
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Build catalog.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # authenticated org/release reads, server-side only
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          # Prior catalog (immutable-asset cache) comes from the live site, not from git.
+          curl -sf -o catalog-prior.json "https://hyspy-dev.github.io/meridian/catalog.json" || true
+          CATALOG_PRIOR=catalog-prior.json CATALOG_OUT=_site/catalog.json python tools/build-catalog.py
+          {
+            echo '<!doctype html><meta charset="utf-8"><title>Meridian catalog</title>'
+            echo '<p>Machine-readable component catalog for the Meridian launcher:'
+            echo '<a href="catalog.json">catalog.json</a></p>'
+          } > _site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

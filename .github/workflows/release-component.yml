@@ -1,0 +1,263 @@
+# Reusable release workflow for every Meridian component (modules, core, proxy, launcher).
+#
+# A component repo triggers this on a version tag (v1.2.0) with a ~10-line caller workflow.
+# Game support is derived from the repos themselves — nothing is declared by hand:
+#
+#   • The GAME AXIS is meridian-protocol's `line/<game>` branches (each branch's pom version
+#     IS the wire CRC, guarded in its build — never read from the umbrella conf).
+#   • A component is GAME-BOUND iff its own pom depends on meridian-protocol. A game-bound
+#     component is built once per protocol line; a neutral one gets a single Layer-2 jar.
+#   • The component's own `line/<game>` branch is an OVERRIDE for when its source actually
+#     diverges for that line; without one, the tagged commit is built for every line.
+#   • A line the component does not compile against is SKIPPED with a warning (exactly like
+#     the umbrella build.sh) — it simply doesn't appear in the catalog for that game.
+#
+# Per-game jars are renamed `<artifact>-<version>+<game>[...].jar` so they never collide in
+# one release. The release gets every jar plus a CI-generated `meridian.json` manifest
+# ({kind, version, builds:[{asset, sha256, size, proto?, games?, module?}]}) — the catalog
+# builder aggregates these without ever downloading a jar. Finally a repository_dispatch
+# pokes the umbrella catalog workflow so the Pages catalog refreshes within seconds.
+name: Release component
+
+on:
+  workflow_call:
+    inputs:
+      artifact_glob:
+        description: "Glob (relative to the repo root) matching the shippable jar(s) after `mvn package`"
+        type: string
+        default: "target/*.jar"
+      kind:
+        description: "module | proxy | launcher — recorded in meridian.json for the catalog builder"
+        type: string
+        default: "module"
+      java:
+        type: string
+        default: "25"
+    secrets:
+      dispatch_token:
+        description: "Fine-grained PAT that may POST /repos/<org>/meridian/dispatches (org secret CATALOG_DISPATCH_TOKEN). Optional: without it the catalog refreshes on its daily schedule instead."
+        required: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5   # the tagged commit — its poms declare protocol dependence
+
+      - name: Derive version and game lines
+        id: plan
+        run: |
+          set -euo pipefail
+          [ "${GITHUB_REF_TYPE}" = "tag" ] || { echo "::error::must run on a tag push (got ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME})"; exit 1; }
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$VERSION" in *-*) PRE=true ;; *) PRE=false ;; esac
+
+          # Game-bound iff a pom of this repo depends on meridian-protocol.
+          if grep -rlq --include=pom.xml '<artifactId>meridian-protocol</artifactId>' .; then
+            LINES=$(git ls-remote --heads "https://github.com/${GITHUB_REPOSITORY_OWNER}/meridian-protocol" 'refs/heads/line/*' \
+                    | sed 's#.*refs/heads/line/##' | sort -V)
+            [ -n "$LINES" ] || { echo "::error::meridian-protocol has no line/* branches — the game axis is empty"; exit 1; }
+            # The component's own line/<game> branch overrides the tag when its source diverges.
+            SELF_LINES=$(git ls-remote --heads "https://github.com/${GITHUB_REPOSITORY}" 'refs/heads/line/*' \
+                         | sed 's#.*refs/heads/line/##')
+            MATRIX=$(for G in $LINES; do
+                       if printf '%s\n' $SELF_LINES | grep -qx "$G"; then REF="refs/heads/line/$G"; else REF="$GITHUB_REF"; fi
+                       jq -n --arg g "$G" --arg r "$REF" '{game: $g, ref: $r}'
+                     done | jq -cs '{include: .}')
+            echo "Game-bound — lines: $(echo $LINES)"
+          else
+            MATRIX=$(jq -nc --arg r "$GITHUB_REF" '{include: [{game: "", ref: $r}]}')
+            echo "Protocol-neutral — one Layer-2 build"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE"  >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX"   >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # one line not compiling must not block the others
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      GAME: ${{ matrix.game }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      ORG: ${{ github.repository_owner }}
+      GLOB: ${{ inputs.artifact_glob }}
+    steps:
+      - name: Checkout component (line override branch, or the tag)
+        uses: actions/checkout@v5
+        with:
+          path: component
+          ref: ${{ matrix.ref }}
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java }}
+          cache: maven
+
+      - name: Install Meridian dependencies from their own repos
+        run: |
+          set -euo pipefail
+          MVN="mvn -B -ntp -DskipTests"
+          SELF="${GITHUB_REPOSITORY##*/}"
+          mkdir -p deps
+
+          clone_dep() {  # <repo> <preferred-branch>; falls back to the default branch
+            local repo="$1" branch="${2:-}"
+            if [ -n "$branch" ] && git ls-remote --exit-code --heads "https://github.com/$ORG/$repo" "refs/heads/$branch" >/dev/null 2>&1; then
+              git clone --quiet --depth 1 --branch "$branch" "https://github.com/$ORG/$repo" "deps/$repo"
+            else
+              git clone --quiet --depth 1 "https://github.com/$ORG/$repo" "deps/$repo"
+            fi
+          }
+
+          [ "$SELF" = meridian-api ] || { clone_dep meridian-api main
+            $MVN -f deps/meridian-api/pom.xml install; }
+
+          CRC=""
+          if [ -n "$GAME" ]; then
+            # Game-bound: the protocol's line/<game> pom version IS the wire CRC (guarded in its build).
+            if [ "$SELF" != meridian-protocol ]; then
+              git clone --quiet --depth 1 --branch "line/$GAME" "https://github.com/$ORG/meridian-protocol" deps/meridian-protocol
+              CRC=$(grep -oPm1 '(?<=<version>)[0-9]+(?=</version>)' deps/meridian-protocol/pom.xml)
+              [ -n "$CRC" ] || { echo "::error::cannot read the CRC (pom version) from meridian-protocol@line/$GAME"; exit 1; }
+              $MVN -f deps/meridian-protocol/pom.xml install
+            fi
+            if [ "$SELF" != meridian-core ] && [ "$SELF" != meridian-protocol ]; then
+              clone_dep meridian-core "line/$GAME"
+              $MVN -f deps/meridian-core/pom.xml -Dmeridian.protocol.version="$CRC" install
+            fi
+          else
+            # Neutral (Layer 2): only the stable APIs (never core-impl, which needs the protocol).
+            if [ "$SELF" != meridian-core ] && [ "$SELF" != meridian-api ]; then
+              clone_dep meridian-core main
+              $MVN -f deps/meridian-core/pom.xml -pl meridian-core-api -am install
+            fi
+          fi
+          echo "CRC=$CRC" >> "$GITHUB_ENV"
+
+      - name: Build, collect, hash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob globstar
+          mkdir -p out
+          # The tag is the only version authority: stamp it into the pom(s) so the artifact's
+          # internal version (e.g. the launcher's filtered version.properties) matches the release.
+          mvn -B -ntp -f component/pom.xml versions:set -DnewVersion="$VERSION" -DgenerateBackupPoms=false
+          if ! mvn -B -ntp -DskipTests ${CRC:+-Dmeridian.protocol.version=$CRC} -f component/pom.xml clean package; then
+            if [ -n "$GAME" ]; then
+              # Not compiling against this line means the line is unsupported — skip it loudly.
+              echo "::warning::${GITHUB_REPOSITORY##*/} does not build against $GAME (protocol ${CRC:-?}) — line skipped"
+              jq -n --arg game "$GAME" '{game: $game, skipped: true, assets: []}' > "out/fragment-$GAME.json"
+              exit 0
+            fi
+            exit 1   # a neutral build failing is just a broken release
+          fi
+          ASSETS='[]'
+          for jar in component/$GLOB; do
+            base=$(basename "$jar" .jar)
+            case "$base" in original-*|*-sources|*-javadoc) continue ;; esac
+            suffix=""
+            case "$base" in *-all) suffix="-all"; base="${base%-all}" ;; esac
+            art=$(printf '%s' "$base" | sed -E 's/-[0-9].*$//')
+            name="${art}-${VERSION}${GAME:++$GAME}${suffix}.jar"
+            cp "$jar" "out/$name"
+            sha=$(sha256sum "out/$name" | cut -d' ' -f1)
+            size=$(stat -c%s "out/$name")
+            MJ=null
+            if unzip -p "out/$name" module.json > mj.json 2>/dev/null && jq -e . mj.json >/dev/null 2>&1; then
+              MJ=$(jq -c . mj.json)
+            fi
+            ASSETS=$(jq -c --arg a "$name" --arg s "$sha" --argjson sz "$size" --argjson m "$MJ" \
+                     '. + [{asset:$a, sha256:$s, size:$sz, module:$m}]' <<<"$ASSETS")
+          done
+          [ "$ASSETS" != '[]' ] || { echo "::error::artifact_glob '$GLOB' matched no shippable jar"; exit 1; }
+          jq -n --arg game "$GAME" --arg crc "${CRC:-}" --argjson assets "$ASSETS" \
+             '{game: (if $game == "" then null else $game end),
+               proto: (if $crc == "" then null else ($crc | tonumber) end),
+               assets: $assets}' > "out/fragment-${GAME:-all}.json"
+          ls -l out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ strategy.job-index }}
+          path: out/
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    # Run even if some matrix legs failed hard (e.g. a broken dep install for one line):
+    # ship the lines that built. If nothing built, this job fails below.
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    # The CALLER workflow must grant `permissions: contents: write` for the release upload.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Assemble meridian.json
+        env:
+          KIND: ${{ inputs.kind }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          frags=(release/fragment-*.json)
+          [ ${#frags[@]} -gt 0 ] || { echo "::error::no build produced anything — nothing to release"; exit 1; }
+          jq -s -e '[.[] | select(.skipped | not)] | length > 0' "${frags[@]}" >/dev/null \
+            || { echo "::error::every game line was skipped — nothing to release"; exit 1; }
+          jq -s --arg kind "$KIND" --arg ver "$VERSION" '
+            { kind: $kind, version: $ver,
+              builds: [ .[] | select(.skipped | not) as $f | $f.assets[] | . as $a |
+                {asset: $a.asset, sha256: $a.sha256, size: $a.size}
+                + (if $f.proto  then {proto: $f.proto}   else {} end)
+                + (if $f.game   then {games: [$f.game]}  else {} end)
+                + (if $a.module then {module: $a.module} else {} end) ] }
+          ' "${frags[@]}" > meridian.json
+          {
+            echo "Built: $(jq -rs '[.[] | select(.skipped | not) | .game // "game-neutral"] | join(", ")' "${frags[@]}")"
+            SKIPPED=$(jq -rs '[.[] | select(.skipped) | .game] | join(", ")' "${frags[@]}")
+            [ -z "$SKIPPED" ] || echo "Skipped (does not build against): $SKIPPED"
+          } > notes.txt
+          rm release/fragment-*.json
+          mv meridian.json release/
+          cat release/meridian.json notes.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${GITHUB_REPOSITORY##*/} ${GITHUB_REF_NAME}" \
+            --notes-file notes.txt \
+            $([ "$PRERELEASE" = "true" ] && echo --prerelease) \
+            release/*.jar release/meridian.json
+
+  dispatch:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Poke the umbrella catalog workflow
+        env:
+          TOKEN: ${{ secrets.dispatch_token }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "No dispatch_token — the catalog will pick this release up on its daily schedule."
+            exit 0
+          fi
+          curl -sf -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/meridian/dispatches" \
+            -d '{"event_type":"catalog-update"}'
