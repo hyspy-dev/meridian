@@ -168,6 +168,21 @@ jobs:
             art=$(printf '%s' "$base" | sed -E 's/-[0-9].*$//')
             name="${art}-${VERSION}${GAME:++$GAME}${suffix}.jar"
             cp "$jar" "out/$name"
+            # Self-describing jar — the same stamp the umbrella build.sh makes:
+            #   builtFor         the wire CRC of the build (always, when known)
+            #   requiresProtocol whether this module's pom really depends on meridian-protocol
+            # so "built by the 0.5.9 recipe" and "needs the 0.5.9 protocol" stay separate facts.
+            if unzip -p "out/$name" module.json > mj.json 2>/dev/null && jq -e . mj.json >/dev/null 2>&1; then
+              REQ=false
+              grep -rqs --include=pom.xml '<artifactId>meridian-protocol</artifactId>' component && REQ=true
+              mkdir -p stamp
+              jq --argjson req "$REQ" --arg crc "${CRC:-}" \
+                 '{requiresProtocol: $req}
+                  + (if $crc == "" then {} else {builtFor: ($crc | tonumber)} end)
+                  + (. | del(.builtFor, .requiresProtocol))' mj.json > stamp/module.json
+              (cd stamp && zip -q "../out/$name" module.json)
+              rm -rf stamp
+            fi
             sha=$(sha256sum "out/$name" | cut -d' ' -f1)
             size=$(stat -c%s "out/$name")
             MJ=null

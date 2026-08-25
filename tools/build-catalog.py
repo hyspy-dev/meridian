@@ -134,7 +134,14 @@ def module_entry_from_manifest(release, asset, build, manifest):
         "minProxyVersion": mj.get("minProxyVersion") or mj.get("minCoreVersion"),
         "maxProxyVersion": mj.get("maxProxyVersion") or mj.get("maxCoreVersion"),
         "dependsOn": mj.get("dependsOn"),
-        "layer1": bool(build.get("games")) or bool(requires.get("packets")),
+        # Build stamp from the jar's own module.json (the source of truth); `proto` from the
+        # release manifest is the fallback for jars built before the stamp existed.
+        "builtFor": mj.get("builtFor", build.get("proto")),
+        "requiresProtocol": mj.get("requiresProtocol"),
+        # Stamped jars state it outright; for jars built before the stamp, fall back to the old
+        # signals (a per-game build, or declared packet requirements).
+        "layer1": bool(mj["requiresProtocol"]) if "requiresProtocol" in mj
+                  else (bool(build.get("games")) or bool(requires.get("packets"))),
         "games": build.get("games"),
     }
 
@@ -162,7 +169,10 @@ def module_entry_legacy(release, asset, prior):
         "minProxyVersion": mj.get("minProxyVersion") or mj.get("minCoreVersion"),
         "maxProxyVersion": mj.get("maxProxyVersion") or mj.get("maxCoreVersion"),
         "dependsOn": mj.get("dependsOn"),
-        "layer1": bool(requires.get("packets")),
+        "builtFor": mj.get("builtFor"),
+        "requiresProtocol": mj.get("requiresProtocol"),
+        "layer1": bool(mj["requiresProtocol"]) if "requiresProtocol" in mj
+                  else bool(requires.get("packets")),
         "games": games_from_tag(release.get("tag_name")),
     }
 

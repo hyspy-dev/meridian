@@ -105,6 +105,30 @@ resolve() {   # <name>
 
 listed() { c_names | grep -qx "$1"; }
 
+# Make every built jar self-describing: the BUILD writes two facts into the module.json inside
+# it (the author's sources are never touched, and nothing has to be declared by hand):
+#
+#   "builtFor":         the wire CRC of the recipe this jar was built with — always
+#   "requiresProtocol": whether the module's pom really depends on meridian-protocol
+#
+# The two are independent on purpose: being built BY the 0.5.9 recipe is not the same as
+# depending on the 0.5.9 protocol. A module with requiresProtocol=false loads on any proxy no
+# matter which recipe produced it; one with true is only loaded by a proxy speaking builtFor.
+JAR_TOOL="$(command -v jar || echo "${JAVA_HOME:-}/bin/jar")"
+stamp_build_info() {   # <jar-in-dist> <module-source-dir>
+  local jarfile="$1" srcdir="$2" tmp req=false
+  grep -rq --include=pom.xml '<artifactId>meridian-protocol</artifactId>' "$srcdir" && req=true
+  tmp="$(mktemp -d)"
+  ( cd "$tmp" && "$JAR_TOOL" xf "$jarfile" module.json 2>/dev/null ) || true
+  if [ -f "$tmp/module.json" ]; then
+    # Drop any previous stamp (rebuilds, or a jar built by another recipe), then write ours.
+    sed -i -e '/"builtFor"[[:space:]]*:/d' -e '/"requiresProtocol"[[:space:]]*:/d' "$tmp/module.json"
+    sed -i "0,/{/s//{\\n  \"builtFor\": $PROTOCOL_CRC,\\n  \"requiresProtocol\": $req,/" "$tmp/module.json"
+    ( cd "$tmp" && "$JAR_TOOL" uf "$jarfile" module.json )
+  fi
+  rm -rf "$tmp"
+}
+
 # Build one component the right way: core libs install to .m2; proxy/launcher package into dist/;
 # anything else is a module -> dist/modules (best-effort). Old artifacts for THIS component are
 # cleared first, so a single-component rebuild replaces cleanly even when its version string changed.
@@ -119,8 +143,11 @@ build_one() {
       echo "== install $name"; mvnw -f "$dir/pom.xml" -DskipTests clean install
       # core-impl is a loadable module (module.json + shaded core-api) other modules dependsOn.
       rm -f "$DIST"/modules/meridian-core-impl-*.jar
-      find "$dir/meridian-core-impl/target" -maxdepth 1 -name 'meridian-core-impl-*.jar' \
-           ! -name 'original-*' ! -name '*-sources.jar' ! -name '*-javadoc.jar' -exec cp {} "$DIST/modules/" \; ;;
+      while IFS= read -r j; do
+        cp "$j" "$DIST/modules/"
+        stamp_build_info "$DIST/modules/$(basename "$j")" "$dir/meridian-core-impl"
+      done < <(find "$dir/meridian-core-impl/target" -maxdepth 1 -name 'meridian-core-impl-*.jar' \
+               ! -name 'original-*' ! -name '*-sources.jar' ! -name '*-javadoc.jar') ;;
     meridian-proxy)
       dir="$(resolve "$name")" || return 1
       echo "== build   $name"; mvnw -f "$dir/pom.xml" -DskipTests clean package
@@ -136,8 +163,11 @@ build_one() {
       dir="$(resolve "$name")" || { echo "  ~ SKIP $name — cannot resolve"; SKIPPED="$SKIPPED $name"; return 0; }
       echo "== module  $name"
       if mvnw -f "$dir/pom.xml" -DskipTests clean package; then
-        find "$dir/target" -maxdepth 1 -name '*.jar' \
-             ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name 'original-*' -exec cp {} "$DIST/modules/" \;
+        while IFS= read -r j; do
+          cp "$j" "$DIST/modules/"
+          stamp_build_info "$DIST/modules/$(basename "$j")" "$dir"
+        done < <(find "$dir/target" -maxdepth 1 -name '*.jar' \
+                 ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name 'original-*')
       else echo "  ~ SKIP $name — doesn't build against $GAME (protocol $PROTOCOL_CRC)"; SKIPPED="$SKIPPED $name"; fi ;;
   esac
 }
